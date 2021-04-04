@@ -1,0 +1,280 @@
+#먼저 데이터를 다운받습니다:
+
+import os
+import tarfile
+import urllib.request
+
+DOWNLOAD_ROOT = "http://spamassassin.apache.org/old/publiccorpus/"
+HAM_URL = DOWNLOAD_ROOT + "20030228_easy_ham.tar.bz2"
+SPAM_URL = DOWNLOAD_ROOT + "20030228_spam.tar.bz2"
+SPAM_PATH = os.path.join("datasets", "spam")
+
+def fetch_spam_data(ham_url=HAM_URL, spam_url=SPAM_URL, spam_path=SPAM_PATH):
+    if not os.path.isdir(spam_path):
+        os.makedirs(spam_path)
+    for filename, url in (("ham.tar.bz2", ham_url), ("spam.tar.bz2", spam_url)):
+        path = os.path.join(spam_path, filename)
+        if not os.path.isfile(path):
+            urllib.request.urlretrieve(url, path)
+        tar_bz2_file = tarfile.open(path)
+        tar_bz2_file.extractall(path=spam_path)
+        tar_bz2_file.close()
+
+fetch_spam_data()
+
+#다음, 모든 이메일을 읽어 들입니다:
+
+HAM_DIR = os.path.join(SPAM_PATH, "easy_ham")
+SPAM_DIR = os.path.join(SPAM_PATH, "spam")
+ham_filenames = [name for name in sorted(os.listdir(HAM_DIR)) if len(name) > 20]
+spam_filenames = [name for name in sorted(os.listdir(SPAM_DIR)) if len(name) > 20]
+
+len(ham_filenames)
+
+len(spam_filenames)
+
+#파이썬의 `email` 모듈을 사용해 이메일을 파싱합니다(헤더, 인코딩 등을 처리합니다):
+
+import email
+import email.policy
+
+def load_email(is_spam, filename, spam_path=SPAM_PATH):
+    directory = "spam" if is_spam else "easy_ham"
+    with open(os.path.join(spam_path, directory, filename), "rb") as f:
+        return email.parser.BytesParser(policy=email.policy.default).parse(f)
+
+ham_emails = [load_email(is_spam=False, filename=name) for name in ham_filenames]
+spam_emails = [load_email(is_spam=True, filename=name) for name in spam_filenames]
+
+#어떤 이메일은 이미지나 첨부 파일을 가진 멀티파트(multipart)입니다(메일에 포함되어 있을수 있습니다). 어떤 파일들이 있는지 살펴 보겠습니다:
+
+def get_email_structure(email):
+    if isinstance(email, str):
+        return email
+    payload = email.get_payload()
+    if isinstance(payload, list):
+        return "multipart({})".format(", ".join([
+            get_email_structure(sub_email)
+            for sub_email in payload
+        ]))
+    else:
+        return email.get_content_type()
+
+from collections import Counter
+
+def structures_counter(emails):
+    structures = Counter()
+    for email in emails:
+        structure = get_email_structure(email)
+        structures[structure] += 1
+    return structures
+
+structures_counter(ham_emails).most_common()
+
+structures_counter(spam_emails).most_common()
+
+'''
+햄 메일은 평범한 텍스트가 많고 스팸은 HTML일 경우가 많습니다. 적은 수의 햄 이메일이 PGP로 서명되어 있지만 스팸 메일에는 없습니다. 요약하면 이메일 구조는 유용한 정보입니다.
+
+이제 이메일 헤더를 살펴보겠습니다:
+'''
+
+for header, value in spam_emails[0].items():
+    print(header,":",value)
+
+#보낸사람의 이메일 주소와 같이 헤더에는 유용한 정보가 많이 있지만 여기서는 `Subject` 헤더만 다뤄 보겠습니다:
+
+spam_emails[0]["Subject"]
+
+#좋습니다. 데이터에를 더 살펴보기 전에 훈련 세트와 테스트 세트로 나누도록 하겠습니다:
+
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+X = np.array(ham_emails + spam_emails)
+y = np.array([0] * len(ham_emails) + [1] * len(spam_emails))
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+#이제 전처리 함수를 작성하겠습니다. 먼저 HTML을 일반 텍스트로 변환하는 함수가 필요합니다. 이 작업에는 당연히 [BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/) 라이브러리를 사용하는게 좋지만 의존성을 줄이기 위해서 정규식을 사용하여 대강 만들어 보겠습니다([un̨ho͞ly radiańcé destro҉ying all enli̍̈́̂̈́ghtenment](https://stackoverflow.com/a/1732454/38626)의 위험에도 불구하고). 다음 함수는 `<head>` 섹션을 삭제하고 모든 `<a>` 태그를 HYPERLINK 문자로 바꿉니다. 그런 다음 모든 HTML 태그를 제거하고 텍스트만 남깁니다. 보기 편하게 여러개의 개행 문자를 하나로 만들고 (`&gt;`나 `&nbsp;` 같은) html 엔티티를 복원합니다:
+
+import re
+from html import unescape
+
+def html_to_plain_text(html):
+    text = re.sub('<head.*?>.*?</head>', '', html, flags=re.M | re.S | re.I)
+    text = re.sub('<a\s.*?>', ' HYPERLINK ', text, flags=re.M | re.S | re.I)
+    text = re.sub('<.*?>', '', text, flags=re.M | re.S)
+    text = re.sub(r'(\s*\n)+', '\n', text, flags=re.M | re.S)
+    return unescape(text)
+
+#이제 포맷에 상관없이 이메일을 입력으로 받아서 일반 텍스트를 출력하는 함수를 만들겠습니다:
+
+def email_to_text(email):
+    html = None
+    for part in email.walk():
+        ctype = part.get_content_type()
+        if not ctype in ("text/plain", "text/html"):
+            continue
+        try:
+            content = part.get_content()
+        except: # in case of encoding issues
+            content = str(part.get_payload())
+        if ctype == "text/plain":
+            return content
+        else:
+            html = content
+    if html:
+        return html_to_plain_text(html)
+
+print(email_to_text(sample_html_spam)[:100], "...")
+
+#어간 추출을 해보죠! 이 작업을 하려면 자연어 처리 툴킷([NLTK](http://www.nltk.org/))을 설치해야 합니다. 다음 명령으로 간단히 설치할 수 있습니다(먼저 virtualenv 환경을 활성화시켜야 합니다. 별도의 환경이 없다면 어드민 권한이 필요할지 모릅니다. 아니면 `--user` 옵션을 사용하세요):
+
+#`$ pip install nltk`
+
+try:
+    import nltk
+
+    stemmer = nltk.PorterStemmer()
+    for word in ("Computations", "Computation", "Computing", "Computed", "Compute", "Compulsive"):
+        print(word, "=>", stemmer.stem(word))
+except ImportError:
+    print("Error: stemming requires the NLTK module.")
+    stemmer = None
+
+#인터넷 주소는 "URL" 문자로 바꾸겠습니다. [정규식](https://mathiasbynens.be/demo/url-regex)을 하드 코딩할 수도 있지만 [urlextract](https://github.com/lipoja/URLExtract) 라이브러리를 사용하겠습니다. 다음 명령으로 설치합니다(먼저 virtualenv 환경을 활성화시켜야 합니다. 별도의 환경이 없다면 어드민 권한이 필요할지 모릅니다. 아니면 `--user` 옵션을 사용하세요):
+
+#`$ pip install urlextract`
+
+# 코랩에서 이 노트북을 실행하려면 먼저 pip install urlextract을 실행합니다
+try:
+    import google.colab
+    !pip install -q -U urlextract
+except ImportError:
+    pass # not running on Colab
+
+try:
+    import urlextract # 루트 도메인 이름을 다운로드하기 위해 인터넷 연결이 필요할지 모릅니다
+    
+    url_extractor = urlextract.URLExtract()
+    print(url_extractor.find_urls("Will it detect github.com and https://youtu.be/7Pq-S557XQU?t=3m32s"))
+except ImportError:
+    print("Error: replacing URLs requires the urlextract module.")
+    url_extractor = None
+
+#이들을 모두 하나의 변환기로 연결하여 이메일을 단어 카운트로 바꿀 것입니다. 파이썬의 `split()` 메서드를 사용하면 구둣점과 단어 경계를 기준으로 문장을 단어로 바꿉니다. 이 방법이 많은 언어에 통하지만 전부는 아닙니다. 예를 들어 중국어와 일본어는 일반적으로 단어 사이에 공백을 두지 않습니다. 베트남어는 음절 사이에 공백을 두기도 합니다. 여기서는 데이터셋이 (거의) 영어로 되어 있기 때문에 문제없습니다.
+
+from sklearn.base import BaseEstimator, TransformerMixin
+
+class EmailToWordCounterTransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, strip_headers=True, lower_case=True, remove_punctuation=True,
+                 replace_urls=True, replace_numbers=True, stemming=True):
+        self.strip_headers = strip_headers
+        self.lower_case = lower_case
+        self.remove_punctuation = remove_punctuation
+        self.replace_urls = replace_urls
+        self.replace_numbers = replace_numbers
+        self.stemming = stemming
+    def fit(self, X, y=None):
+        return self
+    def transform(self, X, y=None):
+        X_transformed = []
+        for email in X:
+            text = email_to_text(email) or ""
+            if self.lower_case:
+                text = text.lower()
+            if self.replace_urls and url_extractor is not None:
+                urls = list(set(url_extractor.find_urls(text)))
+                urls.sort(key=lambda url: len(url), reverse=True)
+                for url in urls:
+                    text = text.replace(url, " URL ")
+            if self.replace_numbers:
+                text = re.sub(r'\d+(?:\.\d*)?(?:[eE][+-]?\d+)?', 'NUMBER', text)
+            if self.remove_punctuation:
+                text = re.sub(r'\W+', ' ', text, flags=re.M)
+            word_counts = Counter(text.split())
+            if self.stemming and stemmer is not None:
+                stemmed_word_counts = Counter()
+                for word, count in word_counts.items():
+                    stemmed_word = stemmer.stem(word)
+                    stemmed_word_counts[stemmed_word] += count
+                word_counts = stemmed_word_counts
+            X_transformed.append(word_counts)
+        return np.array(X_transformed)
+
+#이 변환기를 몇 개의 이메일에 적용해 보겠습니다:
+
+X_few = X_train[:6]
+X_few_wordcounts = EmailToWordCounterTransformer().fit_transform(X_few)
+
+#이제 단어 카운트를 벡터로 변환해야 합니다. 이를 위해서 또 다른 변환기를 만들겠습니다. 이 변환기는 (자주 나타나는 단어 순으로 정렬된) 어휘 목록을 구축하는 `fit()` 메서드와 어휘 목록을 사용해 단어를 벡터로 바꾸는 `transform()` 메서드를 가집니다. 출력은 희소 행렬이 됩니다.
+
+from scipy.sparse import csr_matrix
+
+class WordCounterToVectorTransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, vocabulary_size=1000):
+        self.vocabulary_size = vocabulary_size
+    def fit(self, X, y=None):
+        total_count = Counter()
+        for word_count in X:
+            for word, count in word_count.items():
+                total_count[word] += min(count, 10)
+        most_common = total_count.most_common()[:self.vocabulary_size]
+        self.vocabulary_ = {word: index + 1 for index, (word, count) in enumerate(most_common)}
+        return self
+    def transform(self, X, y=None):
+        rows = []
+        cols = []
+        data = []
+        for row, word_count in enumerate(X):
+            for word, count in word_count.items():
+                rows.append(row)
+                cols.append(self.vocabulary_.get(word, 0))
+                data.append(count)
+        return csr_matrix((data, (rows, cols)), shape=(len(X), self.vocabulary_size + 1))
+
+vocab_transformer = WordCounterToVectorTransformer(vocabulary_size=10)
+X_few_vectors = vocab_transformer.fit_transform(X_few_wordcounts)
+X_few_vectors
+
+X_few_vectors.toarray()
+
+#이 행렬은 무엇을 의미하나요? 세 번째 행의 첫 번째 열의 68은 세 번째 이메일이 어휘 목록에 없는 단어를 68개 가지고 있다는 뜻입니다. 그 다음의 0은 어휘 목록에 있는 첫 번째 단어가 한 번도 등장하지 않는다는 뜻이고 그 다음의 1은 한 번 나타난다는 뜻입니다. 이 단어들이 무엇인지 확인하려면 어휘 목록을 보면 됩니다.
+
+vocab_transformer.vocabulary_
+
+#이제 스팸 분류기를 훈련시킬 준비를 마쳤습니다! 전체 데이터셋을 변환시켜보죠:
+
+from sklearn.pipeline import Pipeline
+
+preprocess_pipeline = Pipeline([
+    ("email_to_wordcount", EmailToWordCounterTransformer()),
+    ("wordcount_to_vector", WordCounterToVectorTransformer()),
+])
+
+X_train_transformed = preprocess_pipeline.fit_transform(X_train)
+
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+
+log_clf = LogisticRegression(solver="lbfgs", max_iter=1000, random_state=42)
+score = cross_val_score(log_clf, X_train_transformed, y_train, cv=3, verbose=3)
+score.mean()
+
+#98.5%가 넘네요. 그러나 이 데이터셋은 비교적 쉬운 문제입니다. 더 어려운 데이터셋에 적용해 보면 결과가 그리 높지 않을 것입니다.
+
+#테스트 세트에서 정밀도/재현율을 출력해 보겠습니다:
+
+from sklearn.metrics import precision_score, recall_score
+
+X_test_transformed = preprocess_pipeline.transform(X_test)
+
+log_clf = LogisticRegression(solver="lbfgs", max_iter=1000, random_state=42)
+log_clf.fit(X_train_transformed, y_train)
+
+y_pred = log_clf.predict(X_test_transformed)
+
+print("정밀도: {:.2f}%".format(100 * precision_score(y_test, y_pred)))
+print("재현율: {:.2f}%".format(100 * recall_score(y_test, y_pred)))
