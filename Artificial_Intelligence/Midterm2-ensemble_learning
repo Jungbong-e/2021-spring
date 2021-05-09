@@ -1,0 +1,109 @@
+# MNIST data를 가져와 훈련용 샘플 5만 개, 검증용 샘플 1만 개, 시험용 샘플 1만 개로 나눕니다.
+
+from sklearn.model_selection import train_test_split
+
+X_train_val, X_test, y_train_val, y_test = train_test_split(
+    mnist.data, mnist.target, test_size=10000, random_state=42)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train_val, y_train_val, test_size=10000, random_state=42)
+
+
+# 먼저 훈련용 샘플 5만 개를 이용해 random forest 분류, extra-trees 분류, 선형 SVM 분류, MLP 분류 알고리즘으로 학습합니다.
+
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.svm import LinearSVC
+from sklearn.neural_network import MLPClassifier
+
+random_forest_clf = RandomForestClassifier(n_estimators=100, random_state=42)
+extra_trees_clf = ExtraTreesClassifier(n_estimators=100, random_state=42)
+svm_clf = LinearSVC(max_iter=100, tol=20, random_state=42)
+mlp_clf = MLPClassifier(random_state=42)
+
+estimators = [random_forest_clf, extra_trees_clf, svm_clf, mlp_clf]
+for estimator in estimators:
+    print("Training the", estimator)
+    estimator.fit(X_train, y_train)
+Training the RandomForestClassifier(random_state=42)
+Training the ExtraTreesClassifier(random_state=42)
+Training the LinearSVC(max_iter=100, random_state=42, tol=20)
+Training the MLPClassifier(random_state=42)
+
+[estimator.score(X_val, y_val) for estimator in estimators]
+# Out: [0.9692, 0.9715, 0.859, 0.9639]
+
+
+# 학습된 분류 알고리즘을 종합하는 ensemble 학습을 통해 검증용 샘플 1만 개에 적용합니다.(직접투표 방식)
+
+from sklearn.ensemble import VotingClassifier
+
+named_estimators = [
+    ("random_forest_clf", random_forest_clf),
+    ("extra_trees_clf", extra_trees_clf),
+    ("svm_clf", svm_clf),
+    ("mlp_clf", mlp_clf),
+]
+
+voting_clf = VotingClassifier(named_estimators)
+
+voting_clf.fit(X_train, y_train)
+'''
+Out: VotingClassifier(estimators=[('random_forest_clf',
+                              RandomForestClassifier(random_state=42)),
+                             ('extra_trees_clf',
+                              ExtraTreesClassifier(random_state=42)),
+                             ('svm_clf',
+                              LinearSVC(max_iter=100, random_state=42, tol=20)),
+                             ('mlp_clf', MLPClassifier(random_state=42))])
+'''
+voting_clf.score(X_val, y_val)
+# Out: 0.9711
+
+
+# SVM 분류법이 나머지에 비해 정확도가 떨어지게 나왔으므로 SVM 분류법을 제외하고 앙상블 학습을 적용시켜봅니다.
+
+voting_clf.set_params(svm_clf=None)
+'''
+Out: VotingClassifier(estimators=[('random_forest_clf',
+                              RandomForestClassifier(random_state=42)),
+                             ('extra_trees_clf',
+                              ExtraTreesClassifier(random_state=42)),
+                             ('svm_clf', None),
+                             ('mlp_clf', MLPClassifier(random_state=42))])
+'''
+voting_clf.estimators
+'''
+Out: [('random_forest_clf', RandomForestClassifier(random_state=42)),
+ ('extra_trees_clf', ExtraTreesClassifier(random_state=42)),
+ ('svm_clf', None),
+ ('mlp_clf', MLPClassifier(random_state=42))]
+'''
+
+voting_clf.estimators_
+'''
+Out: [RandomForestClassifier(random_state=42),
+ ExtraTreesClassifier(random_state=42),
+ LinearSVC(max_iter=100, random_state=42, tol=20),
+ MLPClassifier(random_state=42)]
+'''
+
+del voting_clf.estimators_[2]
+
+voting_clf.score(X_val, y_val)
+# Out: 0.9735
+
+
+# 이번에는 간접투표 방식을 이용해봅니다.
+
+voting_clf.voting = "soft"
+
+voting_clf.score(X_val, y_val)
+# Out: 0.9693
+
+# 직접투표 방식으로 했을 때가 오히려 정확도가 더 높게 나왔습니다. 직접투표 방식으로 시험용 샘플 1만개에 적용시켜보겠습니다.
+
+voting_clf.voting = "hard"
+voting_clf.score(X_test, y_test)
+# Out: 0.9706
+
+[estimator.score(X_test, y_test) for estimator in voting_clf.estimators_]
+# Out: [0.9645, 0.9691, 0.9624]
